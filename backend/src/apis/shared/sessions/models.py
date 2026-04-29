@@ -6,7 +6,7 @@ This module contains all session-related data models including:
 - Session preferences and configuration
 """
 
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional, Union
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -18,6 +18,97 @@ class VisualDisplayState(BaseModel):
 
     dismissed: bool = Field(default=False, description="User dismissed this visual")
     expanded: bool = Field(default=True, description="Visual is expanded vs collapsed")
+
+
+class PendingInterrupt(BaseModel):
+    """A paused-turn breadcrumb the frontend uses to rediscover prompts on
+    reload — without it, a browser refresh leaves the prompt stuck and the
+    tool call orphaned in ``pending`` forever.
+
+    Two variants share this shape (discriminated by ``kind``):
+
+    - ``oauth`` — written by ``OAuthConsentHook``. Carries ``provider_id``;
+      the frontend re-fetches a fresh consent URL via ``initiate-consent``
+      on Connect (URLs are short-lived; storing them invites stale-URL bugs).
+    - ``tool_approval`` — written by ``MCPExternalApprovalHook``. Carries
+      ``tool_name`` + ``tool_input`` + ``message`` so the inline approve/decline
+      prompt rehydrates with the same context the user saw before refresh.
+      ``tool_input`` is stored as a JSON-encoded string to avoid DynamoDB's
+      Decimal/float coercion when the agent's tool input contains nested
+      objects with floats.
+
+    Default ``kind`` is ``oauth`` for backward compatibility with rows
+    written before per-tool approval shipped.
+    """
+
+    model_config = ConfigDict(populate_by_name=True)
+    interrupt_id: str = Field(..., alias="interruptId", description="Strands interrupt id used to resume the paused turn")
+    kind: Literal["oauth", "tool_approval"] = Field(
+        default="oauth",
+        description="Discriminator: which variant this interrupt represents",
+    )
+    triggering_message_id: Optional[str] = Field(
+        None,
+        alias="triggeringMessageId",
+        description="Id of the assistant message whose tool call triggered this interrupt, when known",
+    )
+    created_at: str = Field(..., alias="createdAt", description="ISO 8601 timestamp when the interrupt was recorded")
+
+    # OAuth-only fields
+    provider_id: Optional[str] = Field(
+        default=None,
+        alias="providerId",
+        description="(oauth) Connector providerId needing consent",
+    )
+
+    # tool_approval-only fields
+    tool_use_id: Optional[str] = Field(
+        default=None,
+        alias="toolUseId",
+        description="(tool_approval) Strands tool-use id of the paused call",
+    )
+    tool_name: Optional[str] = Field(
+        default=None,
+        alias="toolName",
+        description="(tool_approval) MCP-server-exposed name of the tool",
+    )
+    tool_input: Optional[str] = Field(
+        default=None,
+        alias="toolInput",
+        description="(tool_approval) JSON-encoded tool input arguments",
+    )
+    message: Optional[str] = Field(
+        default=None,
+        description="(tool_approval) Admin-supplied or default approval message",
+    )
+
+
+class PausedTurnSnapshot(BaseModel):
+    """Frozen agent-construction context for a turn that paused on OAuth consent.
+
+    Written once per paused turn so the resume request can rebuild the same
+    ``MainAgent`` shape (matching tool registry, model, prompt) regardless of
+    whether the in-process agent cache still holds it. Strands' session
+    manager separately persists ``_interrupt_state`` to AgentCore Memory, so
+    once the agent is rebuilt with the right shape the interrupt restores
+    automatically and the paused tool call can resume.
+
+    Snapshot wins over current request state on resume: a turn the user
+    already authorized completes with the connector set it was authorized
+    against, even if the user toggled connectors mid-pause.
+    """
+
+    model_config = ConfigDict(populate_by_name=True)
+    enabled_tools: Optional[List[str]] = Field(default=None, alias="enabledTools")
+    model_id: Optional[str] = Field(default=None, alias="modelId")
+    provider: Optional[str] = Field(default=None)
+    temperature: Optional[float] = Field(default=None)
+    system_prompt: Optional[str] = Field(default=None, alias="systemPrompt")
+    caching_enabled: Optional[bool] = Field(default=None, alias="cachingEnabled")
+    max_tokens: Optional[int] = Field(default=None, alias="maxTokens")
+    agent_type: Optional[str] = Field(default=None, alias="agentType")
+    captured_at: str = Field(..., alias="capturedAt", description="ISO 8601 timestamp when the turn paused")
+    expires_at: str = Field(..., alias="expiresAt", description="ISO 8601 timestamp after which the snapshot is no longer valid for resume")
 
 
 class SessionPreferences(BaseModel):
@@ -77,6 +168,18 @@ class SessionMetadata(BaseModel):
     # Soft delete fields
     deleted: Optional[bool] = Field(False, description="Whether session is soft-deleted")
     deleted_at: Optional[str] = Field(None, alias="deletedAt", description="ISO 8601 timestamp of deletion")
+
+    # OAuth consent state
+    pending_interrupts: Optional[List[PendingInterrupt]] = Field(
+        default=None,
+        alias="pendingInterrupts",
+        description="Pending OAuth consent interrupts that paused agent turns in this session",
+    )
+    paused_turn: Optional[PausedTurnSnapshot] = Field(
+        default=None,
+        alias="pausedTurn",
+        description="Agent-construction snapshot for a turn paused on OAuth consent; cleared on successful resume or when a new turn supersedes it",
+    )
 
 
 class UpdateSessionMetadataRequest(BaseModel):
@@ -260,7 +363,7 @@ class MessageMetadata(BaseModel):
     token_usage: Optional[TokenUsage] = Field(None, alias="tokenUsage", description="Token usage statistics")
     model_info: Optional[ModelInfo] = Field(None, alias="modelInfo", description="Model information for cost tracking")
     attribution: Optional[Attribution] = Field(None, description="Attribution for cost tracking and billing")
-    cost: Optional[float] = Field(None, description="Total cost in USD for this message (computed from token usage and pricing)")
+    cost: Optional[Union[float, Dict[str, float]]] = Field(None, description="Cost for this message — either a total float (legacy) or a breakdown dict with total, inputCost, outputCost, cacheReadCost, cacheWriteCost")
     citations: Optional[List[Dict[str, str]]] = Field(None, description="RAG citations for this message (stored as dicts for flexible JSON storage)")
     display_text: Optional[str] = Field(None, alias="displayText", description="Original user message text before RAG augmentation (for clean UI display)")
     # Note: Feedback will be added in future implementation
@@ -298,3 +401,8 @@ class MessagesListResponse(BaseModel):
 
     messages: List[MessageResponse] = Field(..., description="List of messages in the session")
     next_token: Optional[str] = Field(None, alias="nextToken", description="Pagination token for retrieving the next page of results")
+    pending_interrupts: List[PendingInterrupt] = Field(
+        default_factory=list,
+        alias="pendingInterrupts",
+        description="OAuth consent interrupts that paused agent turns in this session and are awaiting user action",
+    )

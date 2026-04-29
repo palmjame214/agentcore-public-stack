@@ -29,15 +29,49 @@ export interface SessionsListResponse {
 }
 
 /**
+ * Pending OAuth consent interrupt that paused an agent turn for this session.
+ *
+ * Returned from `GET /sessions/{id}/messages` so the frontend can rediscover
+ * pending consents after a browser refresh. `authorization_url` is intentionally
+ * absent — those expire quickly; the frontend re-fetches on Connect.
+ */
+export interface PendingInterrupt {
+  /** Strands interrupt id used to resume the paused turn */
+  interruptId: string;
+  /**
+   * Discriminator: which variant this interrupt represents. Older rows
+   * written before per-tool approval shipped omit this — backend defaults
+   * to "oauth" on read.
+   */
+  kind?: 'oauth' | 'tool_approval';
+  /** Id of the assistant message whose tool call triggered this interrupt, if known */
+  triggeringMessageId?: string | null;
+  /** ISO 8601 timestamp when the interrupt was recorded */
+  createdAt: string;
+  /** (oauth) Connector providerId needing consent */
+  providerId?: string | null;
+  /** (tool_approval) Strands tool-use id of the paused call */
+  toolUseId?: string | null;
+  /** (tool_approval) MCP-server-exposed tool name */
+  toolName?: string | null;
+  /** (tool_approval) JSON-encoded tool input arguments */
+  toolInput?: string | null;
+  /** (tool_approval) Message to display in the approval prompt */
+  message?: string | null;
+}
+
+/**
  * Response model for listing messages with pagination support.
- * 
+ *
  * Matches the MessagesListResponse model from the Python API.
  */
 export interface MessagesListResponse {
   /** List of messages in the session */
   messages: Message[];
   /** Pagination token for retrieving the next page of results */
-  next_token: string | null;
+  nextToken: string | null;
+  /** OAuth consent interrupts that paused agent turns and are awaiting user action */
+  pendingInterrupts?: PendingInterrupt[];
 }
 
 /**
@@ -369,7 +403,7 @@ export class SessionService {
    * // Get next page
    * const nextPage = await sessionService.getSessions({
    *   limit: 20,
-   *   next_token: response.next_token
+   *   next_token: response.nextToken
    * });
    * ```
    */
@@ -417,17 +451,17 @@ export class SessionService {
    * // Get next page
    * const nextPage = await sessionService.getMessages(
    *   '8e70ae89-93af-4db7-ba60-f13ea201f4cd',
-   *   { limit: 20, next_token: response.next_token }
+   *   { limit: 20, next_token: response.nextToken }
    * );
    * ```
    */
   async getMessages(sessionId: string, params?: GetMessagesParams): Promise<MessagesListResponse> {
     let httpParams = new HttpParams();
-    
+
     if (params?.limit !== undefined) {
       httpParams = httpParams.set('limit', params.limit.toString());
     }
-    
+
     if (params?.next_token) {
       httpParams = httpParams.set('next_token', params.next_token);
     }
@@ -444,6 +478,19 @@ export class SessionService {
     } catch (error) {
       throw error;
     }
+  }
+
+  /**
+   * Dismiss a persisted OAuth pending interrupt for a session. Idempotent —
+   * the backend returns 204 even if the entry is already gone.
+   */
+  async dismissPendingInterrupt(sessionId: string, interruptId: string): Promise<void> {
+    // The interrupt id contains a colon (e.g. ``oauth:google-calendar``);
+    // encode it so it survives URL parsing on the path.
+    const encoded = encodeURIComponent(interruptId);
+    await firstValueFrom(
+      this.http.delete<void>(`${this.baseUrl()}/${sessionId}/pending-interrupts/${encoded}`),
+    );
   }
 
   /**

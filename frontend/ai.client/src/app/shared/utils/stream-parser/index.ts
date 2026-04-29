@@ -55,6 +55,8 @@ export {
   validateQuotaExceededEvent,
   validateConversationalStreamError,
   validateCitation,
+  validateOAuthRequiredEvent,
+  validateToolApprovalRequiredEvent,
 } from './stream-parser-core';
 
 // Types
@@ -74,6 +76,8 @@ export type {
   QuotaExceededEvent,
   StreamErrorEvent,
   ConversationalStreamErrorEvent,
+  OAuthRequiredEvent,
+  ToolApprovalRequiredEvent,
   StreamEventType,
   StreamEventData,
   ParsedStreamEvent,

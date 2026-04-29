@@ -69,6 +69,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Bridge OAuth2CallbackUrl (sent by the frontend on connector calls) onto
+# BedrockAgentCoreContext so IdentityClient can read it during consent flows.
+# WorkloadAccessToken is absent here (no runtime gateway in front of app-api);
+# IdentityClient mints one via AGENTCORE_RUNTIME_WORKLOAD_NAME.
+from apis.shared.middleware.agentcore_context import AgentCoreContextMiddleware
+app.add_middleware(AgentCoreContextMiddleware)
+logger.info("Added AgentCore context middleware")
+
 
 # Import routers
 from apis.app_api.health import router as health_router
@@ -87,7 +95,7 @@ from apis.app_api.assistants.routes import router as assistants_router
 from apis.app_api.documents.routes import router as documents_router
 from apis.app_api.users.routes import router as users_router
 from apis.app_api.user_settings.routes import router as user_settings_router
-from apis.shared.oauth.routes import router as oauth_router
+from apis.app_api.connectors.routes import router as connectors_router
 from apis.app_api.system.routes import router as system_router
 from apis.app_api.shares.routes import conversations_share_router, shares_router, shared_view_router
 
@@ -108,7 +116,7 @@ app.include_router(converse_router)  # Proxies to Inference API for cost account
 app.include_router(memory_router)  # AgentCore Memory access endpoints
 app.include_router(tools_router)  # Tool discovery and permissions
 app.include_router(files_router)  # File upload via pre-signed URLs
-app.include_router(oauth_router)  # OAuth provider connections
+app.include_router(connectors_router)  # User-facing connector catalog + consent flows
 app.include_router(system_router)  # System status and first-boot endpoints
 app.include_router(conversations_share_router)  # Share conversations endpoints
 app.include_router(shares_router)  # Share management (update, revoke, export)
@@ -142,11 +150,16 @@ if os.path.exists(generated_images_dir):
 
 if __name__ == "__main__":
     import uvicorn
+    # Watch the full backend/src tree so edits to shared modules outside
+    # app_api/ (apis/shared/, agents/) trigger reload instead of defaulting
+    # to cwd, which only sees this API's own files.
+    src_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
     # Run with full module path when executing directly
     uvicorn.run(
         "apis.app_api.main:app",
         host="0.0.0.0",
         port=8000,
         reload=True,
+        reload_dirs=[src_root],
         log_level="info"
     )

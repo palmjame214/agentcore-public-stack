@@ -8,6 +8,8 @@ from dataclasses import dataclass
 from typing import List, Dict, Optional
 from enum import Enum
 
+from agents.main_agent.config.constants import Prefixes
+
 
 class ToolCategory(str, Enum):
     """Categories for organizing tools in the UI."""
@@ -56,13 +58,6 @@ TOOL_CATALOG: Dict[str, ToolMetadata] = {
         icon="link",
     ),
     # --- Local Tools (Data & Visualization) ---
-    "get_current_weather": ToolMetadata(
-        tool_id="get_current_weather",
-        name="Weather",
-        description="Get current weather conditions for US locations using coordinates.",
-        category=ToolCategory.DATA,
-        icon="cloud",
-    ),
     "create_visualization": ToolMetadata(
         tool_id="create_visualization",
         name="Charts & Graphs",
@@ -128,7 +123,7 @@ class ToolCatalogService:
 
         Gateway tools are prefixed with 'gateway_' and loaded from MCP servers.
         """
-        if not tool_id.startswith("gateway_"):
+        if not tool_id.startswith(Prefixes.GATEWAY_TOOL):
             tool_id = f"gateway_{tool_id}"
 
         self._catalog[tool_id] = ToolMetadata(

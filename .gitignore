@@ -90,6 +90,8 @@ tmp/
 
 # Claude - exclude personal settings
 .claude/settings.local.json
+.claude/scheduled_tasks.lock
+.claude/worktrees/
 
 # OS generated files
 ehthumbs.db

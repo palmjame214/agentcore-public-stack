@@ -87,6 +87,39 @@ export interface ReasoningEvent {
 }
 
 /**
+ * OAuth required event — emitted when an external MCP tool needs the user
+ * to grant consent via AgentCore Identity. The agent's tool call is paused
+ * (Strands interrupt) and the frontend resumes the same turn after the
+ * user completes consent by POSTing back the carried `interruptId`.
+ */
+export interface OAuthRequiredEvent {
+  type: 'oauth_required';
+  providerId: string;
+  authorizationUrl: string;
+  interruptId: string;
+}
+
+/**
+ * Tool approval required event — emitted when an MCP tool flagged
+ * `needs_approval` in the catalog is about to run. The agent's tool call
+ * is paused (Strands interrupt); the frontend renders an inline
+ * approve/decline prompt and resumes the same turn by POSTing the carried
+ * `interruptId` with `response: "approved" | "declined"`.
+ */
+export interface ToolApprovalRequiredEvent {
+  type: 'tool_approval_required';
+  interruptId: string;
+  toolUseId: string;
+  toolName: string;
+  /** JSON-encoded tool input arguments. Pre-stringified by the backend so
+   *  one shape works for both the live SSE event and the persisted
+   *  PendingInterrupt breadcrumb (which DynamoDB would otherwise coerce
+   *  floats inside). */
+  toolInput?: string;
+  message: string;
+}
+
+/**
  * Tool result event data structure
  */
 export interface ToolResultEventData {
@@ -123,7 +156,8 @@ export type StreamEventType =
   | 'quota_warning'
   | 'quota_exceeded'
   | 'stream_error'
-  | 'citation';
+  | 'citation'
+  | 'oauth_required';
 
 /**
  * Union type of all possible event data types
@@ -143,6 +177,7 @@ export type StreamEventData =
   | StreamErrorEvent
   | ConversationalStreamErrorEvent
   | Citation
+  | OAuthRequiredEvent
   | null
   | undefined;
 

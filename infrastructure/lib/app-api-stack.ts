@@ -405,6 +405,11 @@ export class AppApiStack extends cdk.Stack {
         PROJECT_PREFIX: config.projectPrefix,
         FRONTEND_URL: config.domainName ? `https://${config.domainName}` : 'http://localhost:4200',
         CORS_ORIGINS: buildCorsOrigins(config, config.appApi.additionalCorsOrigins).join(','),
+        // OAuth2 callback URL fallback when the frontend's `OAuth2CallbackUrl`
+        // header is absent — see apis/shared/oauth/agentcore_identity.py.
+        AGENTCORE_LOCAL_OAUTH_CALLBACK_URL: config.domainName
+          ? `https://${config.domainName}/oauth-complete`
+          : 'http://localhost:4200/oauth-complete',
         DYNAMODB_QUOTA_TABLE: userQuotasTableName,
         DYNAMODB_EVENTS_TABLE: quotaEventsTableName,
         DYNAMODB_OIDC_STATE_TABLE_NAME: oidcStateTableName,
@@ -445,6 +450,19 @@ export class AppApiStack extends cdk.Stack {
         DYNAMODB_API_KEYS_TABLE_NAME: apiKeysTableName,
         OAUTH_TOKEN_ENCRYPTION_KEY_ARN: oauthTokenEncryptionKeyArn,
         OAUTH_CLIENT_SECRETS_ARN: oauthClientSecretsArn,
+        DYNAMODB_OAUTH_PROVIDERS_TABLE_NAME: oauthProvidersTableName,
+        DYNAMODB_OAUTH_USER_TOKENS_TABLE_NAME: oauthUserTokensTableName,
+        // Shared platform workload identity (created in InfrastructureStack).
+        // Both app-api and inference-api mint against this same identity so
+        // the OAuth token vault is shared: a user consents once via the
+        // settings page and the runtime agent loop sees the same vaulted
+        // token. The runtime's own auto-created identity is service-linked
+        // and only mintable from inside the runtime container, so we cannot
+        // share that one across services.
+        AGENTCORE_RUNTIME_WORKLOAD_NAME: ssm.StringParameter.valueForStringParameter(
+          this,
+          `/${config.projectPrefix}/oauth/platform-workload-identity-name`
+        ),
         DYNAMODB_AUTH_PROVIDERS_TABLE_NAME: authProvidersTableName,
         AUTH_PROVIDER_SECRETS_ARN: authProviderSecretsArn,
         DYNAMODB_USER_SETTINGS_TABLE_NAME: userSettingsTableName,
@@ -917,6 +935,119 @@ export class AppApiStack extends cdk.Stack {
         resources: [`${oauthClientSecretsArn}*`], // Wildcard for random suffix
       })
     );
+
+    // AgentCore Identity stores each provider's OAuth client secret in a
+    // Secrets Manager secret it provisions under `bedrock-agentcore-identity!
+    // default/oauth2/*`. Create/Update/Delete on the provider authorize the
+    // corresponding Secrets Manager call against the caller's identity (the
+    // app-api ECS task role), so the full lifecycle of admin CRUD needs:
+    //   - CreateSecret + TagResource: CreateOauth2CredentialProvider
+    //   - PutSecretValue + UpdateSecret: UpdateOauth2CredentialProvider
+    //     (re-submits the full config including a new clientSecret)
+    //   - DeleteSecret: DeleteOauth2CredentialProvider
+    //   - GetSecretValue: GetResourceOauth2Token (AgentCore reads the
+    //     client secret on every consent / token-refresh call, using the
+    //     caller's IAM identity)
+    taskDefinition.taskRole.addToPrincipalPolicy(
+      new iam.PolicyStatement({
+        sid: 'AgentCoreOAuthSecretLifecycle',
+        effect: iam.Effect.ALLOW,
+        actions: [
+          'secretsmanager:CreateSecret',
+          'secretsmanager:DeleteSecret',
+          'secretsmanager:GetSecretValue',
+          'secretsmanager:PutSecretValue',
+          'secretsmanager:UpdateSecret',
+          'secretsmanager:TagResource',
+          'secretsmanager:DescribeSecret',
+        ],
+        resources: [
+          `arn:aws:secretsmanager:${config.awsRegion}:${config.awsAccount}:secret:bedrock-agentcore-identity!default/oauth2/*`,
+        ],
+      })
+    );
+
+    // Admin CRUD for OAuth2 credential providers stored in AgentCore Identity.
+    // Provider-scoped actions are scoped to the default token vault; List
+    // requires a broader resource since it enumerates the vault itself.
+    // CreateTokenVault is required because the first CreateOauth2CredentialProvider
+    // call in a region implicitly provisions the `default` token vault.
+    taskDefinition.taskRole.addToPrincipalPolicy(
+      new iam.PolicyStatement({
+        sid: 'AgentCoreCredentialProviderAdmin',
+        effect: iam.Effect.ALLOW,
+        actions: [
+          'bedrock-agentcore:CreateTokenVault',
+          'bedrock-agentcore:CreateOauth2CredentialProvider',
+          'bedrock-agentcore:UpdateOauth2CredentialProvider',
+          'bedrock-agentcore:DeleteOauth2CredentialProvider',
+          'bedrock-agentcore:GetOauth2CredentialProvider',
+          'bedrock-agentcore:ListOauth2CredentialProviders',
+        ],
+        resources: [
+          `arn:aws:bedrock-agentcore:${config.awsRegion}:${config.awsAccount}:token-vault/default`,
+          `arn:aws:bedrock-agentcore:${config.awsRegion}:${config.awsAccount}:token-vault/default/oauth2credentialprovider/*`,
+        ],
+      })
+    );
+
+    // User-facing consent flows: app-api mints user-scoped workload tokens
+    // against the shared platform workload identity (defined in
+    // InfrastructureStack) so it shares the OAuth vault with the
+    // inference-api agent loop. Mirrors the runtime task role's
+    // permissions. Without these, /connectors/{id}/{status,initiate,
+    // disconnect,complete} return 503 from the app-api routes.
+    taskDefinition.taskRole.addToPrincipalPolicy(
+      new iam.PolicyStatement({
+        sid: 'AgentCoreWorkloadAccessToken',
+        effect: iam.Effect.ALLOW,
+        actions: [
+          'bedrock-agentcore:GetWorkloadAccessToken',
+          'bedrock-agentcore:GetWorkloadAccessTokenForJWT',
+          'bedrock-agentcore:GetWorkloadAccessTokenForUserId',
+        ],
+        resources: [
+          `arn:aws:bedrock-agentcore:${config.awsRegion}:${config.awsAccount}:workload-identity-directory/default`,
+          `arn:aws:bedrock-agentcore:${config.awsRegion}:${config.awsAccount}:workload-identity-directory/default/workload-identity/*`,
+        ],
+      })
+    );
+
+    taskDefinition.taskRole.addToPrincipalPolicy(
+      new iam.PolicyStatement({
+        sid: 'AgentCoreResourceOauth2Token',
+        effect: iam.Effect.ALLOW,
+        actions: [
+          'bedrock-agentcore:GetResourceOauth2Token',
+          'bedrock-agentcore:CompleteResourceTokenAuth',
+        ],
+        resources: [
+          `arn:aws:bedrock-agentcore:${config.awsRegion}:${config.awsAccount}:token-vault/default`,
+          `arn:aws:bedrock-agentcore:${config.awsRegion}:${config.awsAccount}:token-vault/default/*`,
+          `arn:aws:bedrock-agentcore:${config.awsRegion}:${config.awsAccount}:workload-identity-directory/default`,
+          `arn:aws:bedrock-agentcore:${config.awsRegion}:${config.awsAccount}:workload-identity-directory/default/workload-identity/*`,
+        ],
+      })
+    );
+
+    // Custom metrics for OAuth admin flows (e.g. ProviderOrphaned emitted
+    // by `_emit_orphan_metric` when a failed DB write + failed rollback
+    // leaves an AgentCore credential provider stranded). PutMetricData
+    // cannot be resource-scoped; we scope via the namespace condition.
+    taskDefinition.taskRole.addToPrincipalPolicy(
+      new iam.PolicyStatement({
+        sid: 'OAuthAdminMetrics',
+        effect: iam.Effect.ALLOW,
+        actions: ['cloudwatch:PutMetricData'],
+        resources: ['*'],
+        conditions: {
+          StringEquals: {
+            'cloudwatch:namespace': 'Agentcore/OAuth',
+          },
+        },
+      })
+    );
+
     // Grant permissions for API Keys table (imported from Infrastructure Stack)
     taskDefinition.taskRole.addToPrincipalPolicy(
       new iam.PolicyStatement({

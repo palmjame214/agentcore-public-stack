@@ -32,7 +32,7 @@ npx cdk deploy --all
 
 ## Key Conventions
 
-- **Deploy order:** Infrastructure → Gateway → App API → Inference API → Frontend
+- **Deploy order:** Infrastructure → Gateway → Inference API → App API → Frontend (App API reads `runtime-workload-identity-name` from SSM, published by Inference API)
 - **Admin endpoints** go under `/admin/<domain>/`, user-facing under `/<domain>/`
 - **Errors stream as assistant messages** via SSE (not HTTP error codes)
 - **Signal-based state** throughout frontend (`signal()`, `computed()`)
@@ -48,6 +48,7 @@ npx cdk deploy --all
 | `message_stop` | End of message |
 | `tool_use` / `tool_result` | Tool invocation and result |
 | `stream_error` | Conversational error |
+| `oauth_required` | External MCP tool needs user consent — payload `{providerId, authorizationUrl}`, one event per provider emitted after `message_stop` |
 | `done` | Stream complete |
 
 ## Multi-Protocol Tool Architecture
@@ -75,6 +76,15 @@ npx cdk deploy --all
 | New Angular page | `frontend/ai.client/src/app/<feature>/` |
 | New CDK stack | `infrastructure/lib/<stack-name>-stack.ts` |
 | Shared backend utils | `backend/src/apis/shared/` |
+| Shared backend middleware | `backend/src/apis/shared/middleware/` |
+
+### Inference API boundary
+
+The `inference-api` runs inside an AgentCore Runtime container. The runtime data plane (`https://bedrock-agentcore.<region>.amazonaws.com/runtimes/<arn>/...`) only proxies the standard AgentCore paths — `POST /invocations` and `GET /ping`. **Other HTTP paths return 404 from AWS before the request ever reaches the container**, so any custom route added to inference-api is unreachable in cloud. Local dev is misleading because `localhost:8001` bypasses the runtime gateway entirely.
+
+**Rule:** Don't add routes to `inference-api` unless they're part of the AgentCore Runtime invocation path (i.e. the chat router that owns `/invocations` and `/ping`). User-facing CRUD-ish endpoints — even ones that share dependencies with the agent loop — belong in `app-api`. If a coding agent suggests adding endpoints to inference-api "because it has the workload context," push back: the right pattern is to mint workload context on app-api via the `AGENTCORE_RUNTIME_WORKLOAD_NAME` mint fallback in `apis/shared/oauth/agentcore_identity.py`.
+
+If you're tempted to add to inference-api because of an existing route there (`converse_router`, `voice_router`), don't use them as templates without confirming their access path — they predate this rule and may rely on bypasses (API key, WebSocket upgrade, direct container reach in environments where the runtime isn't the only path).
 
 ## Debugging Quick Reference
 

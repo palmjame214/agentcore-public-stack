@@ -14,6 +14,12 @@ import {
   QuotaWarning,
   QuotaExceeded,
 } from '../../../services/quota/quota-warning.service';
+import { OAuthConsentService } from '../../../services/oauth-consent/oauth-consent.service';
+import { ToolApprovalService } from '../../../services/tool-approval/tool-approval.service';
+import type {
+  OAuthRequiredEvent,
+  ToolApprovalRequiredEvent,
+} from '../../../shared/utils/stream-parser';
 import {
   processStreamEvent,
   createStreamLineParser,
@@ -48,6 +54,8 @@ export class StreamParserService {
   private chatStateService = inject(ChatStateService);
   private errorService = inject(ErrorService);
   private quotaWarningService = inject(QuotaWarningService);
+  private oauthConsentService = inject(OAuthConsentService);
+  private toolApprovalService = inject(ToolApprovalService);
 
   // =========================================================================
   // State Signals
@@ -194,8 +202,11 @@ export class StreamParserService {
     }
 
     // Check if we should process this event
-    const isStartOrErrorEvent = event === 'message_start' || event === 'error';
-    if (!isStartOrErrorEvent && !this.shouldProcessEvent()) {
+    // oauth_required arrives after message_stop/done by design (see CLAUDE.md SSE
+    // table) — allow it through even when the stream state is Completed.
+    const isAlwaysAllowedEvent =
+      event === 'message_start' || event === 'error' || event === 'oauth_required';
+    if (!isAlwaysAllowedEvent && !this.shouldProcessEvent()) {
       return;
     }
 
@@ -288,6 +299,48 @@ export class StreamParserService {
 
       onQuotaWarning: (data) => this.quotaWarningService.setWarning(data as QuotaWarning),
       onQuotaExceeded: (data) => this.quotaWarningService.setQuotaExceeded(data as QuotaExceeded),
+
+      onOAuthRequired: (data: OAuthRequiredEvent) => {
+        // oauth_required arrives after message_stop, so the triggering
+        // assistant message is normally in completedMessages; fall back
+        // to the in-flight builder for tool_use stop reasons that keep
+        // the message active.
+        const messages = this.allMessages();
+        let lastAssistantId: string | undefined;
+        for (let i = messages.length - 1; i >= 0; i--) {
+          if (messages[i].role === 'assistant') {
+            lastAssistantId = messages[i].id;
+            break;
+          }
+        }
+        this.oauthConsentService.requestConsent(
+          data.providerId,
+          data.authorizationUrl,
+          data.interruptId,
+          lastAssistantId,
+          this.sessionId ?? undefined,
+        );
+      },
+
+      onToolApprovalRequired: (data: ToolApprovalRequiredEvent) => {
+        const messages = this.allMessages();
+        let lastAssistantId: string | undefined;
+        for (let i = messages.length - 1; i >= 0; i--) {
+          if (messages[i].role === 'assistant') {
+            lastAssistantId = messages[i].id;
+            break;
+          }
+        }
+        this.toolApprovalService.requestApproval({
+          interruptId: data.interruptId,
+          toolUseId: data.toolUseId,
+          toolName: data.toolName,
+          toolInput: data.toolInput ?? undefined,
+          message: data.message,
+          messageId: lastAssistantId,
+          sessionId: this.sessionId ?? undefined,
+        });
+      },
 
       onError: (data) => this.handleError(data),
       onStreamError: (data) =>

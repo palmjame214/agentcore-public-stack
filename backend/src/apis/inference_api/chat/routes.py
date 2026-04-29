@@ -7,6 +7,7 @@ Implements AgentCore Runtime required endpoints:
 These endpoints are at the root level to comply with AWS Bedrock AgentCore Runtime requirements.
 """
 
+import asyncio
 import json
 import logging
 import os
@@ -35,9 +36,10 @@ from apis.shared.quota import (
 )
 
 from apis.shared.rbac.service import get_app_role_service
+from apis.shared.sessions.metadata import ensure_session_metadata_exists
 
 from .models import FileContent, InvocationRequest
-from .service import get_agent
+from .service import generate_conversation_title, get_agent
 
 logger = logging.getLogger(__name__)
 
@@ -209,7 +211,13 @@ async def invocations(request: InvocationRequest, current_user: User = Depends(g
     input_data = request
     user_id = current_user.user_id
     auth_token = current_user.raw_token
-    logger.info("Invocation request received")
+    # Resume requests reuse the cached agent and its paused interrupt state;
+    # they bypass quota, file resolution, and RAG augmentation because those
+    # already ran on the original turn that got paused.
+    is_resume = bool(input_data.interrupt_responses)
+    logger.info(
+        "Invocation request received (resume=%s)" % is_resume
+    )
     logger.info("Message received")
 
     if input_data.enabled_tools:
@@ -242,10 +250,41 @@ async def invocations(request: InvocationRequest, current_user: User = Depends(g
             logger.warning("Failed to resolve file upload IDs")
             # Continue without files rather than failing the request
 
+    # Pre-create session metadata so OAuth interrupts and other state can
+    # attach to the session row from turn one. Best-effort; on failure the
+    # post-stream lazy-create in StreamCoordinator still covers it.
+    #
+    # Also clear any stale paused_turn snapshot at the start of a fresh turn.
+    # If the user abandoned a paused turn and started a new one, the prior
+    # snapshot is no longer authorized — letting it survive would let a
+    # later (mistaken) resume request pick up against a turn the user
+    # already moved past.
+    is_new_session = False
+    if not is_resume:
+        is_new_session = await ensure_session_metadata_exists(input_data.session_id, user_id)
+        try:
+            from apis.shared.sessions.metadata import clear_paused_turn
+            await clear_paused_turn(input_data.session_id, user_id)
+        except Exception as e:
+            logger.error("Failed to clear stale paused_turn on new turn: %s", e, exc_info=True)
+
+    # First turn → kick off title generation concurrently with the stream.
+    # Runs as a background task so it doesn't add latency to TTFT. The
+    # targeted UpdateExpression in update_session_title is race-safe with
+    # the post-stream _update_session_metadata write.
+    if is_new_session and input_data.message:
+        asyncio.create_task(
+            generate_conversation_title(
+                session_id=input_data.session_id,
+                user_id=user_id,
+                user_input=input_data.message,
+            )
+        )
+
     # Check quota if enforcement is enabled
     quota_warning_event = None
     quota_exceeded_event = None
-    if is_quota_enforcement_enabled():
+    if is_quota_enforcement_enabled() and not is_resume:
         try:
             quota_checker = get_quota_checker()
             quota_result = await quota_checker.check_quota(user=current_user, session_id=input_data.session_id)
@@ -304,7 +343,7 @@ async def invocations(request: InvocationRequest, current_user: User = Depends(g
         "Invocation request - processing with assistant context"
     )
 
-    if input_data.rag_assistant_id:
+    if input_data.rag_assistant_id and not is_resume:
         # Local imports to avoid circular dependency
         from apis.shared.assistants.rag_service import (
             augment_prompt_with_context,
@@ -509,29 +548,104 @@ async def invocations(request: InvocationRequest, current_user: User = Depends(g
             logger.info("Preview session - skipping assistant_id persistence")
 
     try:
-        # Resolve caching_enabled based on managed model configuration
-        # This allows admins to disable caching for models that don't support it
-        caching_enabled = await _resolve_caching_enabled(model_id=input_data.model_id, explicit_caching_enabled=input_data.caching_enabled)
+        # Resume requests rebuild the agent from the persisted PausedTurnSnapshot
+        # so a refresh / cache eviction / pod restart between pause and resume
+        # still lands on the same MainAgent shape (matching tool registry,
+        # model, prompt). Strands' SessionManager separately restores
+        # `_interrupt_state` from AgentCore Memory, so the paused tool call
+        # picks up where it left off. Non-resume requests use the request
+        # body as before.
+        if is_resume:
+            from datetime import datetime, timezone
+            from apis.shared.sessions.metadata import clear_paused_turn, get_paused_turn
 
-        if caching_enabled is False:
-            logger.info("Prompt caching disabled for model")
+            snapshot = await get_paused_turn(input_data.session_id, user_id)
+            if not snapshot:
+                logger.warning(
+                    "Resume rejected: no paused_turn snapshot for session %s",
+                    input_data.session_id,
+                )
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="No paused turn for this session; restart the turn.",
+                )
+            try:
+                expires_at = datetime.fromisoformat(snapshot.expires_at)
+            except ValueError:
+                expires_at = None
+            if expires_at and datetime.now(timezone.utc) > expires_at:
+                logger.warning(
+                    "Resume rejected: paused_turn snapshot expired for session %s",
+                    input_data.session_id,
+                )
+                await clear_paused_turn(input_data.session_id, user_id)
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Paused turn expired; restart the turn.",
+                )
 
-        # Get agent instance with user-specific configuration
-        # AgentCore Memory tracks preferences across sessions per user_id
-        # Supports multiple LLM providers: AWS Bedrock, OpenAI, and Google Gemini
-        # Use augmented message and assistant system prompt if assistant RAG was applied
-        agent = get_agent(
-            session_id=input_data.session_id,
-            user_id=user_id,
-            auth_token=auth_token,
-            enabled_tools=input_data.enabled_tools,
-            model_id=input_data.model_id,
-            temperature=input_data.temperature,
-            system_prompt=system_prompt,  # Use assistant's instructions if available
-            caching_enabled=caching_enabled,
-            provider=input_data.provider,
-            max_tokens=input_data.max_tokens,
-        )
+            caching_enabled = snapshot.caching_enabled
+            agent = await get_agent(
+                session_id=input_data.session_id,
+                user_id=user_id,
+                auth_token=auth_token,
+                enabled_tools=snapshot.enabled_tools,
+                model_id=snapshot.model_id,
+                temperature=snapshot.temperature,
+                system_prompt=snapshot.system_prompt,
+                caching_enabled=snapshot.caching_enabled,
+                provider=snapshot.provider,
+                max_tokens=snapshot.max_tokens,
+                agent_type=snapshot.agent_type,
+            )
+        else:
+            # Resolve caching_enabled based on managed model configuration
+            # This allows admins to disable caching for models that don't support it
+            caching_enabled = await _resolve_caching_enabled(model_id=input_data.model_id, explicit_caching_enabled=input_data.caching_enabled)
+
+            if caching_enabled is False:
+                logger.info("Prompt caching disabled for model")
+
+            # Get agent instance with user-specific configuration
+            # AgentCore Memory tracks preferences across sessions per user_id
+            # Supports multiple LLM providers: AWS Bedrock, OpenAI, and Google Gemini
+            # Use augmented message and assistant system prompt if assistant RAG was applied
+            agent = await get_agent(
+                session_id=input_data.session_id,
+                user_id=user_id,
+                auth_token=auth_token,
+                enabled_tools=input_data.enabled_tools,
+                model_id=input_data.model_id,
+                temperature=input_data.temperature,
+                system_prompt=system_prompt,  # Use assistant's instructions if available
+                caching_enabled=caching_enabled,
+                provider=input_data.provider,
+                max_tokens=input_data.max_tokens,
+                agent_type=input_data.agent_type,
+            )
+
+        # Resume requests must target interrupts that the cached agent
+        # actually has paused. Cache eviction, a process restart, or a
+        # forged request will otherwise be silently accepted by Strands
+        # and drop the client's response. Reject up front so the client
+        # sees a 400 and can restart the turn cleanly.
+        if is_resume:
+            strands_agent = getattr(agent, "agent", None)
+            interrupt_state = getattr(strands_agent, "_interrupt_state", None) if strands_agent else None
+            known_ids: set[str] = set()
+            if interrupt_state and getattr(interrupt_state, "activated", False):
+                interrupts = getattr(interrupt_state, "interrupts", None) or {}
+                known_ids = set(interrupts.keys())
+            submitted_ids = [entry.interruptId for entry in (input_data.interrupt_responses or [])]
+            unknown_ids = [iid for iid in submitted_ids if iid not in known_ids]
+            if unknown_ids:
+                logger.warning(
+                    "Resume rejected: submitted interrupt ids not in paused state"
+                )
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Unknown or expired interrupt ids; restart the turn.",
+                )
 
         # Build citations list for persistence (convert context chunks to citation format)
         citations_for_storage = []
@@ -573,14 +687,69 @@ async def invocations(request: InvocationRequest, current_user: User = Depends(g
                 augmented_message != input_data.message  # RAG augmentation
                 or bool(files_to_send)                   # File attachments
             )
+            # Strands' resume protocol wants each entry wrapped as
+            # {"interruptResponse": {...}}. The InvocationRequest schema
+            # accepts the inner shape so callers don't have to think about
+            # the SDK's content-block convention.
+            interrupt_responses_payload = (
+                [{"interruptResponse": entry.model_dump()} for entry in input_data.interrupt_responses]
+                if input_data.interrupt_responses
+                else None
+            )
+
             async for event in agent.stream_async(
                 augmented_message,
                 session_id=input_data.session_id,
                 files=files_to_send if files_to_send else None,
                 citations=citations_for_storage if citations_for_storage else None,
                 original_message=input_data.message if message_will_be_modified else None,
+                interrupt_responses=interrupt_responses_payload,
             ):
                 yield event
+
+            # Resume bookkeeping: any interrupt that was submitted in this
+            # request and is no longer present in the agent's interrupt state
+            # has been resolved — drop the persisted breadcrumb so a refresh
+            # doesn't redisplay a stale prompt. Interrupts that re-paused
+            # (same provider, new url) are left in place; the next event
+            # extractor will refresh them.
+            #
+            # When the agent's interrupt state is no longer activated after
+            # streaming, the turn fully completed — clear ``paused_turn`` too
+            # so a stale snapshot doesn't authorize a phantom resume against
+            # an already-finished turn. If interrupts re-paused, the snapshot
+            # was overwritten by ``_extract_oauth_required_events`` for the
+            # next pause, so leave it alone.
+            if is_resume and input_data.interrupt_responses:
+                try:
+                    strands_agent = getattr(agent, "agent", None)
+                    interrupt_state = getattr(strands_agent, "_interrupt_state", None) if strands_agent else None
+                    still_paused: set[str] = set()
+                    state_activated = bool(
+                        interrupt_state and getattr(interrupt_state, "activated", False)
+                    )
+                    if state_activated:
+                        still_paused = set((getattr(interrupt_state, "interrupts", None) or {}).keys())
+                    resolved_ids = [
+                        entry.interruptId
+                        for entry in input_data.interrupt_responses
+                        if entry.interruptId not in still_paused
+                    ]
+                    if resolved_ids:
+                        from apis.shared.sessions.metadata import remove_pending_interrupts
+                        await remove_pending_interrupts(
+                            session_id=input_data.session_id,
+                            user_id=user_id,
+                            interrupt_ids=resolved_ids,
+                        )
+                    if not state_activated:
+                        from apis.shared.sessions.metadata import clear_paused_turn
+                        await clear_paused_turn(
+                            session_id=input_data.session_id,
+                            user_id=user_id,
+                        )
+                except Exception as cleanup_err:
+                    logger.error("Failed to clear resolved pending_interrupts: %s", cleanup_err, exc_info=True)
 
         # Stream response from agent as SSE (with optional files)
         # Note: Compression is handled by GZipMiddleware if configured in main.py

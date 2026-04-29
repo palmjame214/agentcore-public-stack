@@ -1,3 +1,309 @@
+# Release Notes — v1.0.0-beta.23
+
+**Release Date:** April 29, 2026
+**Previous Release:** v1.0.0-beta.22 (April 8, 2026)
+
+---
+
+## Highlights
+
+This release introduces **WebSocket voice streaming** with Nova Sonic bidirectional audio, a **multi-agent architecture** with pluggable agent types (Chat, Skill, Voice), **external MCP connectors via AgentCore Identity** replacing the bespoke OAuth token vault, **per-tool approval gates** for dangerous operations, and a full **Playwright E2E testing suite**. The agent layer has been refactored into a BaseAgent → ChatAgent hierarchy with a factory registry, enabling runtime agent-type selection. The legacy in-house OAuth flow (token vault, PKCE service, encryption layer) has been retired in favor of AgentCore Identity's managed credential providers. 252 files changed across 23,000+ lines of new code.
+
+---
+
+## Voice Mode — Bidirectional Audio Streaming
+
+Full-stack voice interaction using Amazon Nova Sonic 2 via the Strands `BidiAgent`. Users can speak to the agent and receive spoken responses in real time, with voice-text continuity that carries context from prior text conversations into voice sessions.
+
+### Backend
+
+- `VoiceAgent(BaseAgent)` wraps `BidiAgent` with `BidiNovaSonicModel` for configurable voice, sample rate, and model selection
+- Voice-text continuity via `_load_text_history()` — loads the text session's message history so the voice agent has full conversational context
+- Separate `agent_id` ("voice") prevents session state conflicts between text and voice turns
+- Voice-optimized system prompt with conversational guidelines
+- WebSocket endpoint at `/voice/stream` (inference API) with JWT auth from query params
+- Bidirectional protocol: audio/text input from client, agent event streaming back
+- Accept-first WebSocket pattern aligned with the `sample-strands-agent-with-agentcore` reference architecture — AgentCore validates auth at the proxy layer
+- Config message supplements missing params in cloud mode; `/voice/stream` for local dev, `/ws` alias for AgentCore Runtime
+- Debug endpoints: `GET /voice/sessions`, `DELETE /voice/sessions/{id}`
+- `CancelledError` handling in `VoiceAgent.stop()` for clean teardown of Nova Sonic streams
+- Real-time cost calculation and token usage metadata for voice turns
+- Log injection prevention via `_sanitize_log()` for all user-provided values in voice routes
+
+### Frontend
+
+Three-layer voice architecture in `session/services/voice/`:
+
+- `pcm-utils.ts`: Pure PCM encoding/decoding (Float32 ↔ Int16 ↔ base64)
+- `AudioRecorderService`: Mic capture via Web Audio API → 16kHz PCM chunks using an AudioWorklet (`pcm-capture.worklet.js`)
+- `AudioPlayerService`: Gapless base64 PCM playback with interruption support
+- `VoiceChatService`: WebSocket orchestration + state machine (idle → connecting → listening → speaking)
+- `VoiceOverlayComponent`: Full-screen voice UI with visualizer orb and status badges
+- Chat input gains a voice toggle button with animated state indicators (pulsing red = listening, bouncing green = speaking, spinner = connecting)
+- Live transcript overlay during voice mode
+- `MessageMapService.addVoiceMessage()` persists finalized voice transcripts to the message list
+
+### Infrastructure
+
+- `strands-agents[bidi]` optional dependency group added to `pyproject.toml`
+- Inference API Dockerfile updated with `bidi` dependency in `uv sync` commands
+- `InferenceApiStack` gains HTTP protocol configuration for WebSocket support
+- Voice router registered in inference API `main.py`
+
+### Test Coverage
+
+16 new VoiceAgent unit tests, 14 voice route tests covering WebSocket auth, bidirectional streaming, and teardown.
+
+---
+
+## Multi-Agent Architecture
+
+The monolithic `MainAgent` has been decomposed into a pluggable agent hierarchy with a factory registry, enabling runtime selection of agent behavior without redeployment.
+
+### Agent Hierarchy
+
+- `BaseAgent` (ABC): Shared initialization for model config, tools, session management, streaming, and approval hooks
+- `ChatAgent(BaseAgent)`: Strands Agent creation and text streaming — the standard conversational agent
+- `MainAgent(ChatAgent)`: Backward-compatible alias so all existing callers work unchanged
+- `SkillAgent(ChatAgent)`: Progressive skill disclosure (see below)
+- `VoiceAgent(BaseAgent)`: Bidirectional audio via BidiAgent (see Voice Mode above)
+
+### Agent Type Registry
+
+`agent_types.py` provides a pluggable registry pattern:
+
+- `create_agent(agent_type, **kwargs)` → `BaseAgent` subclass
+- `register_agent_type(name, cls)` for dynamic registration
+- `ChatAgent` registered as `"chat"`, `SkillAgent` as `"skill"`, `VoiceAgent` as `"voice"` (conditional on `strands-agents[bidi]`)
+
+### Factory Routing
+
+The inference API now routes chat turns through `create_agent(agent_type, ...)` instead of hard-coding `MainAgent`. `InvocationRequest` gains an optional `agent_type` field, folded into the LRU cache key so chat/skill agents for the same session don't collide. `PausedTurnSnapshot` persists the resolved agent type so OAuth-paused turns rebuild on the correct factory variant after cache eviction.
+
+### Configuration Centralization
+
+All environment variables and magic strings consolidated into `agents/main_agent/config/constants.py` with `EnvVars`, `Defaults`, and `Prefixes` classes. 13 modules updated to import from the centralized constants instead of inline `os.getenv()` with hardcoded strings.
+
+### Test Coverage
+
+9 factory tests, 38 skill tests, 16 voice tests, plus existing 543 tests passing with zero behavior change.
+
+---
+
+## Progressive Skill Disclosure
+
+A three-level skill architecture adapted from the `sample-strands-agent` reference, allowing the agent to discover and load tool capabilities on demand rather than loading everything upfront.
+
+### How It Works
+
+- **Level 1**: Lightweight skill catalog injected into the system prompt — the agent sees what skills exist without loading their full instructions
+- **Level 2**: `skill_dispatcher` loads the full `SKILL.md` instructions on demand when the agent decides to use a skill
+- **Level 3**: `skill_executor` runs the actual tool functions bound to the skill
+
+### New Modules
+
+- `skills/skill_registry.py`: Discovers `SKILL.md` files, binds tools, serves the catalog
+- `skills/skill_tools.py`: `skill_dispatcher` + `skill_executor` as Strands `@tool` functions
+- `skills/decorators.py`: `@skill()` decorator and `register_skill()` for tool tagging
+- `skill_agent.py`: `SkillAgent(ChatAgent)` with progressive disclosure override
+
+### Skill Definitions
+
+- `web-search/SKILL.md`: Example skill definition for web search tools
+- `canvas-morning-check/SKILL.md`: Educator-facing morning course health check that surfaces submission rates, struggling students, and upcoming deadlines via the Canvas MCP server, with FERPA-aware anonymization guidance
+
+---
+
+## External MCP Connectors via AgentCore Identity
+
+The bespoke OAuth token vault (per-user DynamoDB encryption, KMS, Secrets Manager client credentials, manual refresh) has been replaced with AgentCore Identity's managed token vault and credential providers. This is a full-stack rewrite of how external MCP tools authenticate with third-party services.
+
+### AgentCore Identity Integration
+
+- `AgentCoreContextMiddleware` copies Runtime headers (`WorkloadAccessToken`, `OAuth2CallbackUrl`, session ID, request ID) into `BedrockAgentCoreContext` on every invocation — required because the Inference API is a plain FastAPI app, not a `BedrockAgentCoreApp`
+- `AgentCoreIdentityClient` wraps `IdentityClient.get_token()` with a narrower surface for `USER_FEDERATION` (3LO) flows, surfacing "user consent required" as a structured `TokenResult(authorization_url=...)` rather than an exception
+- `AgentCoreCredentialProviderRegistrar` wraps `bedrock-agentcore-control` for admin-side OAuth2 credential provider CRUD with vendor mapping (Google/Microsoft/GitHub to native vendors; Canvas/Custom via OIDC discovery URL)
+
+### OAuth Consent Flow
+
+When an external MCP tool needs OAuth consent, the authorization URL flows through the SSE stream as an `oauth_required` event:
+
+- `OAuthConsentService` orchestrates popup opening + `postMessage` receipt
+- `OAuthConsentBanner` renders a "Connect" button inline in the chat
+- `/oauth-complete` landing page handles the AgentCore callback redirect and signals consent completion to the opener tab
+- `PendingInterrupt` gains an `oauth_consent` variant so the consent prompt rehydrates after a page refresh
+
+### Legacy OAuth Retirement
+
+Deleted: `OAuthService`, `OAuthTokenRepository`, `token_cache.py`, encryption layer, user-facing `/oauth/*` routes, `OAuthToolService`, settings/connections page, settings/oauth-callback page. The admin UI has been rebranded from "OAuth Providers" to "Connectors" (`admin/connectors/`), with the form rewritten for the AgentCore-owned shape — credential rotation requires `clientId` + `clientSecret` together (AgentCore's update API is not partial), and the success screen displays the AgentCore callback URL with a copy button.
+
+### Shared Workload Identity
+
+A `CfnWorkloadIdentity` (`<projectPrefix>-platform-workload`) is provisioned in `InfrastructureStack` and shared between inference-api and app-api. Both services mint user-scoped workload tokens against it via `GetWorkloadAccessTokenForUserId`, ensuring the OAuth token vault is keyed consistently — a user consents once and both code paths find the token. The runtime's auto-created identity stays in place but is no longer used for vault calls.
+
+### Infrastructure
+
+- `InfrastructureStack`: New `CfnWorkloadIdentity` + SSM exports
+- `AppApiStack`: IAM grants for Secrets Manager lifecycle (create/update/delete/get) on `bedrock-agentcore-identity!default/oauth2/*`, plus `bedrock-agentcore:GetResourceOauth2Token`
+- `InferenceApiStack`: Runtime workload identity lookup via `AwsCustomResource` (SDK `GetAgentRuntime` call) replacing the broken `Fn::GetAtt` on nested attribute paths; IAM grants for OAuth secret read
+- CloudFront added to API CORS origins
+
+### Test Coverage
+
+278 lines of AgentCore Identity client tests, 245+ lines of external MCP client tests, 787 lines of OAuth consent hook tests, 456 lines of connector route tests, 403 lines of AgentCore registrar tests, 189 lines of context middleware tests, 179 lines of tool freshness tests, 400 lines of session metadata tests, plus updated model and repository tests.
+
+---
+
+## Per-Tool MCP Approval Gate
+
+Replaces the hardcoded `EmailApprovalHook` / `ExternalWriteApprovalHook` / `DangerousToolApprovalHook` with a single `MCPExternalApprovalHook` whose gating set is sourced from per-tool `needs_approval` flags in the tool catalog.
+
+### How It Works
+
+- Admins toggle approval per tool in the catalog via the tool form
+- The hook surfaces a `tool_approval_required` SSE event when a gated tool is invoked
+- The frontend renders an inline approve/decline prompt (`ToolApprovalPromptComponent`)
+- The user's decision resumes the paused turn via the Strands interrupt protocol
+- `PendingInterrupt` gains a `tool_approval` variant so the prompt rehydrates after a page refresh
+
+### Admin Tool Discovery
+
+A new `POST /admin/tools/discover` endpoint calls the MCP server's tool listing to populate tool entries without manual typing, reducing configuration friction for external MCP tools.
+
+### Paused Turn Snapshot Refactor
+
+`_persist_paused_turn_snapshot` extracted as a dedicated helper called once from the `done` branch, so any interrupt flavor (OAuth consent, tool approval, future variants) gets a snapshot without depending on the OAuth extractor running first.
+
+---
+
+## Tool Catalog Simplification
+
+The "Sync from Registry" admin feature has been removed in favor of DynamoDB as the single source of truth for the tool catalog.
+
+- Code-defined tools are now seeded by the bootstrap script (expanded to cover `calculator` and `generate_diagram_and_validate`)
+- Admins add everything else through the "Add Tool" form
+- The in-memory fallback in `ToolCatalogService` has been removed
+- The stale `get_current_weather` local tool has been deleted
+- `ToolAccessService.filter_allowed_tools` now sources its catalog from a TTL-cached DynamoDB snapshot (`freshness.get_all_tool_ids`) instead of the legacy in-memory catalog, fixing an issue where MCP-external and A2A tools added via the admin form were silently filtered out for wildcard-access users
+- Admin create/update/delete invalidate the snapshot so changes are visible on the next chat turn
+
+---
+
+## E2E Testing
+
+A comprehensive Playwright E2E test suite covering authentication, navigation, chat, settings, assistants, and session management.
+
+### Test Coverage
+
+3,400+ lines of new E2E tests across 12 spec files:
+
+- `login.spec.ts`: Authentication flows including Cognito login
+- `navigation.spec.ts`: Route navigation and guards
+- `not-found.spec.ts`: 404 handling
+- `admin-access.user.spec.ts`: Admin route protection
+- `chat.user.spec.ts`: Chat interactions, message sending, model selection
+- `error-handling.user.spec.ts`: Error state handling
+- `file-upload-ui.user.spec.ts`: File upload UI interactions
+- `model-selector.user.spec.ts`: Model dropdown behavior
+- `settings-panel.user.spec.ts`: Settings panel interactions
+- `manage-sessions.user.spec.ts`: Session list management
+- `assistants.user.spec.ts`: Assistant CRUD operations
+- Settings specs: appearance, chat preferences, profile, usage
+
+### Infrastructure
+
+- `playwright.config.ts` and `playwright.ci.config.ts` for local and CI environments
+- Auth setup files (`auth-admin.setup.ts`, `auth-user.setup.ts`) with Cognito account provisioning
+- `scripts/nightly/e2e-test.sh`: E2E runner with dynamic CloudFront URL discovery and Cognito callback URL registration
+- `scripts/nightly/seed-e2e-users.sh`: Cognito user provisioning for nightly runs
+- Seed script integrated into E2E workflow for bootstrap data
+
+---
+
+## Approval Hooks for Dangerous Tool Operations
+
+Three approval hook categories following the `sample-strands-agent` pattern, all using Strands `BeforeToolCallEvent`:
+
+- `EmailApprovalHook`: Gates `send_email`, `delete_emails`, `forward_email`, etc.
+- `ExternalWriteApprovalHook`: Gates `create_pull_request`, `deploy`, `push_code`, etc.
+- `DangerousToolApprovalHook`: Gates `delete_file`, `drop_table`, `execute_sql`, etc.
+
+Hooks set `_approval_required` / `_approval_message` on the tool_use dict for the streaming layer to surface to the client. All hooks registered in `BaseAgent._create_hooks()` — inherited by all agent types.
+
+Note: These category-based hooks were subsequently superseded by the per-tool MCP approval gate (see above), which provides finer-grained control via the tool catalog.
+
+---
+
+## UI Improvements
+
+- **Copy agent response button**: New `MessageActionsComponent` with a copy-to-clipboard button on agent messages
+- **Markdown links open in new tab**: `marked` renderer configured with `target="_blank"` and `rel="noopener noreferrer"` on all rendered links, preventing reverse-tabnabbing via `window.opener`
+
+---
+
+## Bug Fixes
+
+- **Duplicate sidebar entries**: `ensure_session_metadata_exists` was using `put_item` with `attribute_not_exists(PK)`, but the main-table SK encodes `lastMessageAt` (rotated each turn), so the conditional always succeeded and the same session accumulated duplicate rows. Fixed by gating creation on a `SessionLookupIndex` GSI lookup instead
+- **OAuth2CallbackUrl header stripping**: Frontend was appending `?provider_id=<name>` to the callback URL, which the middleware's redirect-pivot guard rejected. The append was redundant — the backend re-tags `provider_id` itself
+- **Workload identity service-linking**: App-api was failing 500 on connector endpoints because `AGENTCORE_RUNTIME_WORKLOAD_NAME` pointed at the runtime's auto-created workload identity, which is service-linked and cannot mint tokens for cross-service callers
+- **CloudFormation GetAtt on nested attributes**: `Fn::GetAtt(AgentCoreRuntime, 'WorkloadIdentityDetails.WorkloadIdentityArn')` rejected by CFN because the resource schema only declares the parent struct as a readonly attribute. Replaced with an `AwsCustomResource` SDK call
+- **Delete-failed state resilience**: Added handling for documents stuck in `delete-failed` state
+
+---
+
+## CI/CD Improvements
+
+- E2E testing integrated into nightly pipeline with dynamic CloudFront URL discovery, Cognito user provisioning, and callback URL registration
+- Testing subdomain added to nightly deploy pipeline
+- Seed script added to E2E workflow for bootstrap data provisioning
+
+### GitHub Actions Updates
+
+| Package | From | To |
+|---|---|---|
+| actions/cache | 5.0.4 | 5.0.5 |
+| docker/build-push-action | 7.0.0 | 7.1.0 |
+| actions/upload-artifact | 7.0.0 | 7.0.1 |
+| github/codeql-action | 4.35.1 | 4.35.2 |
+| aquasecurity/trivy-action | 0.35.0 | 0.36.0 |
+| actions/setup-node | 6.3.0 | 6.4.0 |
+
+---
+
+## Dependency Upgrades
+
+| Component | From | To |
+|---|---|---|
+| fastapi | 0.135.3 | 0.136.1 |
+| uvicorn | 0.44.0 | 0.46.0 |
+| boto3 | 1.42.83 | 1.42.96 |
+| authlib | 1.6.9 | 1.7.0 |
+| strands-agents | 1.34.1 | 1.37.0 |
+| strands-agents-tools | 0.3.0 | 0.5.1 |
+| aws-opentelemetry-distro | 0.16.0 | 0.17.0 |
+| bedrock-agentcore | 1.6.0 | 1.6.4 |
+| openai | 2.30.0 | 2.32.0 |
+| google-genai | 1.70.0 | 1.73.1 |
+| pytest | 9.0.2 | 9.0.3 |
+| hypothesis | 6.151.11 | 6.152.3 |
+| ruff | 0.15.9 | 0.15.12 |
+| mypy | 1.20.0 | 1.20.2 |
+
+---
+
+## Deployment Notes
+
+This release includes new infrastructure resources and significant backend changes. Deploy order matters for the connector feature.
+
+- **Infrastructure:** Deploy first. New `CfnWorkloadIdentity` resource for shared OAuth token vault. SSM parameters added under `/<projectPrefix>/oauth/platform-workload-identity-{name,arn}`.
+- **Backend:** Restart both App API and Inference API containers. The inference API now requires the `bidi` dependency group (`uv sync --extra bidi`). The legacy OAuth service, token vault, and encryption layer have been removed — if you had custom integrations against `/oauth/*` endpoints, they no longer exist. Voice streaming is available at `/voice/stream` (WebSocket).
+- **Frontend:** Full rebuild and deploy required. New voice overlay, connector admin pages, tool approval prompts, and E2E test infrastructure. The settings/connections page has been removed; users manage connector consent inline during chat.
+- **Connectors:** If you had OAuth providers configured under the old system, you must re-register them as AgentCore Identity credential providers via the new admin Connectors page. The old token vault data is not migrated.
+- **Tool Catalog:** The "Sync from Registry" feature is gone. Run the bootstrap seed script to populate code-defined tools, then use the admin "Add Tool" form for everything else.
+- **Nightly/CI:** E2E tests require Playwright and Cognito user provisioning. See `scripts/nightly/e2e-test.sh` and `scripts/nightly/seed-e2e-users.sh`.
+
+---
+
 # Release Notes — v1.0.0-beta.22
 
 **Release Date:** April 8, 2026
